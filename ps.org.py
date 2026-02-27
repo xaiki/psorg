@@ -74,8 +74,11 @@ class PSGameOrganizer:
         """Extracts the best name from the cached JSON."""
         data = self.cache.get(code)
         if not data: return None
+        # Handle manual string overrides in cache
+        if isinstance(data, str):
+            return data
         # SerialStation usually puts the title in 'name' or 'title'
-        return data.get('name') or data.get('title')
+        return data.get('name') or data.get('title')                    
 
     def run(self):
         if not self.base_dir.exists():
