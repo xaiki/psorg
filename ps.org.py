@@ -6,7 +6,7 @@ logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
 
 CACHE_FILE = "ps_cache.json"
-API_URL = "https://api.serialstation.com/v1/content-ids/"
+API_URL = "https://api.serialstation.com/v1/title-ids/"
 FLAT_EXTENSIONS = {'.ffpkg', '.ffpfs', '.ffexfat'}
 
 class PSGameOrganizer:
@@ -16,7 +16,7 @@ class PSGameOrganizer:
         self.code_pattern = re.compile(r'(CUSA|PPSA)[-]?(\d{5})', re.IGNORECASE)
         self.cache = self._load_cache()
         self.session = requests.Session()
-        self.session.headers.update({'User-Agent': 'Mozilla/5.0 PS-Organizer/1.0'})
+        self.session.headers.update({'User-Agent': 'Mozilla/5.0 PS-Organizer/1.0', 'accept': 'application/json'})
 
     def _load_cache(self):
         cache_path = Path(__file__).parent / CACHE_FILE
@@ -41,26 +41,25 @@ class PSGameOrganizer:
         s = re.sub(r'[^a-zA-Z0-9]', '.', name)
         return re.sub(r'\.+', '.', s).strip('.')
 
-    def get_base_game_title(self, code: str):
-        if code in self.cache: return self.cache[code]
-        params = {'title_id': code, 'limit': 100}
+    def fetch_metadata(self, code: str):
+        """Fetches and caches the full JSON response for a given ID."""
+        if code in self.cache and isinstance(self.cache[code], dict):
+            return self.cache[code]
+
+        url = f"{API_URL}{code}"
+        if self.debug:
+            print(f"\n# Debug Curl:\ncurl -X 'GET' '{url}' -H 'accept: application/json'\n")
+
         try:
-            res = self.session.get(API_URL, params=params, timeout=30)
+            res = self.session.get(url, timeout=30)
             if res.status_code == 200:
-                items = res.json().get('items', [])
-                names = [i['name'] for i in items if i.get('name')]
-                if not names: return None
-                names.sort(key=len)
-                base_title = names[0]
-                self.cache[code] = base_title
+                data = res.json()
+                # Store the whole response
+                self.cache[code] = data
                 self._save_cache()
-                return base_title
+                return data
         except Exception as e:
             logger.error(f"❌ API Error for {code}: {e}")
-            if self.debug:
-                print(f"\n# Debug Curl for {code}:")
-                print(f"curl -G '{API_URL}' --data-urlencode 'title_id={code}' -H 'accept: application/json'\n")
-
         return None
 
     def recover_flat_files(self):
@@ -70,71 +69,71 @@ class PSGameOrganizer:
                 if file.suffix.lower() in FLAT_EXTENSIONS:
                     logger.info(f"⏪ Recovering: {file.name} from {folder.name}")
                     shutil.move(str(file), str(self.base_dir / file.name))
-            
-            # Clean up now-empty folders
-            try:
-                if not any(folder.iterdir()):
-                    folder.rmdir()
-            except:
-                pass
+
+    def get_display_name(self, code: str):
+        """Extracts the best name from the cached JSON."""
+        data = self.cache.get(code)
+        if not data: return None
+        # SerialStation usually puts the title in 'name' or 'title'
+        return data.get('name') or data.get('title')
 
     def run(self):
         if not self.base_dir.exists():
             logger.error(f"❌ Path not found: {self.base_dir}")
             return
 
-        # 1. Recover flat files that were moved incorrectly
         self.recover_flat_files()
 
         items = list(self.base_dir.iterdir())
         
-        # 2. Harvest missing titles
-        codes_to_fetch = {self.extract_code(i.name) for i in items if self.extract_code(i.name)}
-        for code in codes_to_fetch:
-            if code and code not in self.cache:
-                self.get_base_game_title(code)
+        # Sync Cache
+        codes = {self.extract_code(i.name) for i in items if self.extract_code(i.name)}
+        for code in codes:
+            if code not in self.cache:
+                logger.info(f"🌐 Syncing metadata for {code}...")
+                self.fetch_metadata(code)
 
-        # 3. Organize
+        # Organize
         for item in items:
-            if item.name == "INCOMING" or item.name == CACHE_FILE: continue
+            if item.name in [CACHE_FILE, "INCOMING"]: continue
             
             code = self.extract_code(item.name)
             if not code: continue
 
-            title = self.cache.get(code)
-            if not title:
-                if self.debug:
-                    logger.warning(f"🔍 Skipping {item.name}: ID {code} not in cache/API.")
-                continue
-            
-            clean_title = self.sanitize(title)
-            
-            # FLAT FILE LOGIC: Rename only
-            if item.is_file() and item.suffix.lower() in FLAT_EXTENSIONS:
-                expected_filename = f"{clean_title}.{code}{item.suffix.lower()}"
-                if item.name != expected_filename:
-                    logger.info(f"📝 Renaming flat file: {item.name} ➡️ {expected_filename}")
-                    item.rename(self.base_dir / expected_filename)
+            raw_name = self.get_display_name(code)
+            if not raw_name:
+                logger.warning(f"⚠️ No metadata for {code}, skipping.")
                 continue
 
-            # DIRECTORY LOGIC: For folders and other file types (PKGs/Zips)
+            clean_title = self.sanitize(raw_name)
+            ext = item.suffix.lower()
+
+            # Flat File Logic
+            if item.is_file() and ext in FLAT_EXTENSIONS:
+                expected = f"{clean_title}.{code}{ext}"
+                if item.name != expected:
+                    logger.info(f"📝 Renaming flat file: {item.name} ➡️ {expected}")
+                    item.rename(self.base_dir / expected)
+                continue
+
+            # Standard Directory Logic
             expected_folder = f"{clean_title}.{code}"
             target_dir = self.base_dir / expected_folder
 
             if item.name != expected_folder:
                 if item.is_dir():
-                    if target_dir.exists() and target_dir.resolve() != item.resolve():
+                    if target_dir.exists():
                         logger.info(f"🚜 Merging: {item.name} ➡️ {expected_folder}")
                         for f in item.iterdir(): shutil.move(str(f), str(target_dir/f.name))
                         item.rmdir()
                     else:
-                        logger.info(f"🔧 Correcting: {item.name} ➡️ {expected_folder}")
+                        logger.info(f"🔧 Correcting folder: {item.name} ➡️ {expected_folder}")
                         item.rename(target_dir)
                 else:
                     target_dir.mkdir(exist_ok=True)
                     logger.info(f"🚚 Moving: {item.name} ➡️ {expected_folder}/")
                     shutil.move(str(item), str(target_dir/item.name))
-                    
+
 if __name__ == "__main__":
     debug = "--debug" in sys.argv
     clean_args = [a for a in sys.argv if a != "--debug" and not a.endswith('.py')]
