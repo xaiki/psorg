@@ -1,0 +1,68 @@
+#+TITLE: psorg.py
+#+AUTHOR: Game Dump Manager
+#+OPTIONS: toc:nil num:nil
+
+* Overview
+=psorg.py= is a reentrant script to organize PS4/PS5 game dumps. It uses CUSA/PPSA codes to fetch metadata via [[https://api.serialstation.com/v1/docs][SerialStation]] and creates a structured library.
+
+* Features
+- **CUSA/PPSA Detection**: Automatically extracts codes from filenames.
+- **Metadata Integration**: Fetches real game titles from SerialStation API.
+- **Archive Isolation**: PKGs go to root; RAR/ZIP archives go to =INCOMING/=.
+- **Reentrant**: Safely run multiple times; skips already organized folders.
+- **Sanitization**: Fixes filesystem-invalid characters automatically.
+
+* Setup
+1. **Dependencies**:
+   #+BEGIN_SRC bash
+   pip install requests python-dotenv
+   #+END_SRC
+
+2. **Configuration**:
+   Create a =.env= file in the script directory:
+   #+BEGIN_SRC conf
+   # Optional if using public endpoints
+   SERIAL_STATION_API_KEY=your_key_here
+   #+END_SRC
+
+* Usage
+#+BEGIN_SRC bash
+# Organize current directory
+python psorg.py
+
+# Organize specific path
+python psorg.py /path/to/dumps
+
+# Debug mode (prints curl commands)
+python psorg.py /path/to/dumps --debug
+#+END_SRC
+
+* Logic & Structure
+** Transformation
+#+BEGIN_SRC text
+/dumps/
+├── game_CUSA12345.pkg
+└── game_CUSA12345.part1.rar
+
+   --- becomes ---
+
+/dumps/
+└── Game.Title.CUSA12345/
+    ├── game_CUSA12345.pkg
+    └── INCOMING/
+        ├── game_CUSA12345.part1.rar
+        └── EXTRACT_README.txt
+#+END_SRC
+
+** Rules
+- **PKG Files**: Moved to the game's root folder.
+- **Archives (RAR/ZIP)**: Moved to =INCOMING/= to prevent cluttering the root.
+- **Metadata Fallback**: If the API is unreachable, the script will NOT rename existing folders to "Unknown" to prevent data loss.
+
+* Troubleshooting
+- **API Timeouts**: Use =--debug= to get curl commands for manual testing.
+- **Cache**: Mappings are stored in =ps_cache.json=. Edit this file to manually override names.
+- **Permissions**: Ensure the user has write access to the target directory.
+
+* License
+Organize legally obtained backups only. Use at your own risk.
