@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Optimized mkffpkg with QEMU/FreeBSD support - NO file copying
-Uses local directories for VM storage
+Supports multiple architectures (amd64, arm64, etc.)
 """
 
 import os
@@ -14,6 +14,7 @@ import subprocess
 import requests
 import hashlib
 import shutil
+import platform
 from pathlib import Path
 from typing import Tuple, Optional, Dict, List
 from dataclasses import dataclass
@@ -34,13 +35,48 @@ EXT_PS4         = ".ffexfat"
 EXT_PS5         = ".ffufs"
 CODE_PATTERN    = re.compile(r'(CUSA|PPSA)[-]?(\d{5})', re.IGNORECASE)
 
-# Default FreeBSD version
+# Architecture mappings
+# Maps user-friendly arch names to FreeBSD QEMU target names
+ARCH_MAP = {
+    'amd64': {
+        'qemu_system': 'qemu-system-x86_64',
+        'freebsd_arch': 'amd64',
+        'qemu_target': 'x86_64',
+        'description': 'AMD64 (x86_64)'
+    },
+    'x86_64': {
+        'qemu_system': 'qemu-system-x86_64',
+        'freebsd_arch': 'amd64',
+        'qemu_target': 'x86_64',
+        'description': 'AMD64 (x86_64)'
+    },
+    'arm64': {
+        'qemu_system': 'qemu-system-aarch64',
+        'freebsd_arch': 'aarch64',
+        'qemu_target': 'aarch64',
+        'description': 'ARM64 (AArch64)'
+    },
+    'aarch64': {
+        'qemu_system': 'qemu-system-aarch64',
+        'freebsd_arch': 'aarch64',
+        'qemu_target': 'aarch64',
+        'description': 'ARM64 (AArch64)'
+    },
+    'riscv64': {
+        'qemu_system': 'qemu-system-riscv64',
+        'freebsd_arch': 'riscv',
+        'qemu_target': 'riscv64',
+        'description': 'RISC-V 64-bit'
+    }
+}
+
+# Default architecture (target for emulation)
+DEFAULT_ARCH = "amd64"  # We want to run amd64 FreeBSD
 DEFAULT_FREEBSD_VERSION = "13.5-RELEASE"
 
 # QEMU/FreeBSD configuration - LOCAL DIRECTORIES
 VM_BASE_DIR     = Path("./freebsd-vm-base").absolute()      # Base VM images
 VM_OVERLAY_DIR  = Path("./freebsd-vm-overlays").absolute()  # VM overlays
-BASE_VM_IMAGE   = VM_BASE_DIR / "freebsd-base.qcow2"
 VM_SSH_PORT     = 2222
 VM_USER         = "psbuilder"
 
@@ -51,17 +87,27 @@ MOUNT_TAG_OUTPUT = "output"
 class FreeBSDVM:
     """Manages FreeBSD VM with overlay filesystem for caching"""
     
-    def __init__(self, games_base: Path, output_base: Path, freebsd_version: str = DEFAULT_FREEBSD_VERSION, 
+    def __init__(self, games_base: Path, output_base: Path, arch: str = DEFAULT_ARCH,
+                 freebsd_version: str = DEFAULT_FREEBSD_VERSION, 
                  debug: bool = False, keep_alive: bool = True):
         self.debug = debug
         self.keep_alive = keep_alive
+        self.arch = arch
         self.freebsd_version = freebsd_version
         self.vm_id = None
         self.overlay_path = None
         self.games_base = games_base.resolve()
         self.output_base = output_base.resolve()
         self.vm_pid_file = None
-        self.accel_type = None  # Will be 'kvm' or 'tcg'
+        self.accel_type = None  # Will be 'kvm', 'hvf', or 'tcg'
+        
+        # Get architecture config
+        if arch not in ARCH_MAP:
+            raise ValueError(f"Unsupported architecture: {arch}. Supported: {list(ARCH_MAP.keys())}")
+        
+        self.arch_config = ARCH_MAP[arch]
+        self.qemu_binary = self.arch_config['qemu_system']
+        self.freebsd_arch = self.arch_config['freebsd_arch']
         
         # Create directories
         VM_BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -71,48 +117,67 @@ class FreeBSDVM:
         self._detect_acceleration()
         
         # Check if base VM exists, if not, create it
-        if not BASE_VM_IMAGE.exists():
-            logger.warning(f"Base VM not found: {BASE_VM_IMAGE}")
+        base_vm_path = self._get_base_vm_path()
+        if not base_vm_path.exists():
+            logger.warning(f"Base VM not found: {base_vm_path}")
             if self._create_base_vm():
                 logger.info("✅ Base VM created successfully")
             else:
                 raise FileNotFoundError(f"Failed to create base VM. Please check dependencies.")
     
+    def _get_base_vm_path(self) -> Path:
+        """Get path for base VM image based on architecture"""
+        return VM_BASE_DIR / f"freebsd-{self.freebsd_arch}-base.qcow2"
+    
     def _detect_acceleration(self):
-        """Detect available QEMU acceleration"""
-        # Check if KVM is available
-        kvm_available = False
-        if Path("/dev/kvm").exists():
-            # Check if we can access /dev/kvm
-            if os.access("/dev/kvm", os.R_OK | os.W_OK):
-                kvm_available = True
-            else:
-                logger.warning("⚠️  /dev/kvm exists but not accessible (permission issue)")
+        """Detect available QEMU acceleration for the host architecture"""
+        host_arch = platform.machine()
         
-        if kvm_available:
-            # Test if KVM actually works
-            try:
-                result = subprocess.run(
-                    ["qemu-system-x86_64", "-accel", "kvm", "-display", "none", "-M", "none"],
-                    capture_output=True, text=True, timeout=2
-                )
-                if result.returncode == 0:
-                    self.accel_type = "kvm"
-                    logger.info("✅ KVM acceleration available (hardware virtualization)")
-                else:
-                    self.accel_type = "tcg"
-                    logger.warning(f"⚠️  KVM not working, falling back to TCG (slower): {result.stderr}")
-            except:
-                self.accel_type = "tcg"
-                logger.warning("⚠️  KVM test failed, falling back to TCG (slower)")
-        else:
+        # Check if we're cross-emulating
+        is_cross_emulation = (host_arch != self.arch_config['qemu_target'])
+        
+        if is_cross_emulation:
+            logger.info(f"⚠️  Cross-emulating {self.arch} on {host_arch} - using TCG (slow)")
             self.accel_type = "tcg"
-            logger.warning("⚠️  KVM not available, using TCG emulation (this will be slower)")
+            return
         
-        if self.accel_type == "tcg":
-            logger.info("💡 Tip: For better performance, enable KVM:")
-            logger.info("   - On Linux: add user to 'kvm' group: sudo usermod -aG kvm $USER")
-            logger.info("   - On VM: enable nested virtualization")
+        # Native emulation, check for accelerators
+        if sys.platform == 'darwin':
+            # macOS Hypervisor.framework
+            if shutil.which('hvf'):
+                self.accel_type = "hvf"
+                logger.info("✅ Using HVF acceleration (macOS Hypervisor.framework)")
+            else:
+                self.accel_type = "tcg"
+                logger.warning("⚠️  HVF not available, using TCG (slower)")
+        else:
+            # Linux KVM
+            if Path("/dev/kvm").exists() and os.access("/dev/kvm", os.R_OK | os.W_OK):
+                # Test if KVM works for this architecture
+                try:
+                    result = subprocess.run(
+                        [self.qemu_binary, "-accel", "kvm", "-display", "none", "-M", "none"],
+                        capture_output=True, text=True, timeout=2
+                    )
+                    if result.returncode == 0:
+                        self.accel_type = "kvm"
+                        logger.info(f"✅ KVM acceleration available for {self.arch}")
+                    else:
+                        self.accel_type = "tcg"
+                        logger.warning(f"⚠️  KVM not working for {self.arch}, using TCG")
+                except:
+                    self.accel_type = "tcg"
+                    logger.warning("⚠️  KVM test failed, using TCG")
+            else:
+                self.accel_type = "tcg"
+                logger.warning("⚠️  KVM not available, using TCG (slower)")
+        
+        if self.accel_type == "tcg" and not is_cross_emulation:
+            logger.info("💡 Tip: For better performance, enable hardware acceleration")
+            if sys.platform == 'darwin':
+                logger.info("   - On macOS: HVF is built into QEMU")
+            else:
+                logger.info("   - On Linux: add user to 'kvm' group: sudo usermod -aG kvm $USER")
     
     def _check_qemu_img(self) -> bool:
         """Check if qemu-img is available"""
@@ -123,19 +188,31 @@ class FreeBSDVM:
         logger.debug(f"Found qemu-img: {qemu_img}")
         return True
     
+    def _check_qemu_binary(self) -> bool:
+        """Check if QEMU system binary is available"""
+        qemu_bin = shutil.which(self.qemu_binary)
+        if not qemu_bin:
+            logger.error(f"❌ {self.qemu_binary} not found. Please install QEMU for {self.arch}")
+            logger.info(f"   On Ubuntu/Debian: apt-get install qemu-system-{self.arch_config['qemu_target']}")
+            logger.info(f"   On macOS: brew install qemu")
+            return False
+        logger.debug(f"Found QEMU binary: {qemu_bin}")
+        return True
+    
     def _create_base_vm(self) -> bool:
         """Create a base FreeBSD VM if it doesn't exist"""
-        logger.info("📦 Creating base FreeBSD VM (this may take a few minutes)...")
+        logger.info(f"📦 Creating base FreeBSD VM for {self.arch} (this may take a few minutes)...")
         
         if not self._check_qemu_img():
             return False
         
-        # Download FreeBSD cloud image
-        temp_image = VM_BASE_DIR / "freebsd-download.qcow2"
-        compressed_img = VM_BASE_DIR / "freebsd-download.qcow2.xz"
+        base_vm_path = self._get_base_vm_path()
+        temp_image = VM_BASE_DIR / f"freebsd-download-{self.freebsd_arch}.qcow2"
+        compressed_img = VM_BASE_DIR / f"freebsd-download-{self.freebsd_arch}.qcow2.xz"
         
         try:
-            url = f"https://download.freebsd.org/ftp/releases/VM-IMAGES/{self.freebsd_version}/amd64/Latest/FreeBSD-{self.freebsd_version}-amd64.qcow2.xz"
+            # Construct download URL based on architecture
+            url = f"https://download.freebsd.org/ftp/releases/VM-IMAGES/{self.freebsd_version}/{self.freebsd_arch}/Latest/FreeBSD-{self.freebsd_version}-{self.freebsd_arch}.qcow2.xz"
             logger.info(f"Downloading FreeBSD image from {url}...")
             
             # Use wget or curl
@@ -168,11 +245,12 @@ class FreeBSDVM:
             ], check=True, capture_output=True)
             
             # Move to final location
-            temp_image.rename(BASE_VM_IMAGE)
+            temp_image.rename(base_vm_path)
             
-            logger.info("Base VM image created. You may want to customize it with tools.")
-            logger.info("To customize, run:")
-            logger.info(f"  qemu-system-x86_64 -drive file={BASE_VM_IMAGE},format=qcow2 -netdev user,id=net0 -device virtio-net,netdev=net0")
+            logger.info(f"Base VM image created: {base_vm_path}")
+            logger.info("You may want to customize it with tools.")
+            logger.info(f"To customize, run:")
+            logger.info(f"  {self.qemu_binary} -drive file={base_vm_path},format=qcow2 -netdev user,id=net0 -device virtio-net,netdev=net0")
             logger.info("Then inside VM: pkg install -y makefs bash")
             
             return True
@@ -186,20 +264,21 @@ class FreeBSDVM:
     
     def start(self) -> bool:
         """Start VM with overlay for this session"""
-        if not self._check_qemu_img():
+        if not self._check_qemu_img() or not self._check_qemu_binary():
             return False
         
         # Create overlay for this VM instance
         self.vm_id = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
-        self.overlay_path = VM_OVERLAY_DIR / f"overlay-{self.vm_id}.qcow2"
+        self.overlay_path = VM_OVERLAY_DIR / f"overlay-{self.vm_id}-{self.arch}.qcow2"
         
-        logger.info(f"🚀 Starting FreeBSD VM (overlay: {self.overlay_path.name})")
+        logger.info(f"🚀 Starting FreeBSD VM for {self.arch} (overlay: {self.overlay_path.name})")
         logger.info(f"⚡ Acceleration: {self.accel_type.upper()}")
+        logger.info(f"📝 QEMU binary: {self.qemu_binary}")
         
         # Create overlay from base image - USE ABSOLUTE PATH for backing file
         try:
-            # Get absolute path of base image
-            base_image_abs = BASE_VM_IMAGE.absolute()
+            base_vm_path = self._get_base_vm_path()
+            base_image_abs = base_vm_path.absolute()
             overlay_path_abs = self.overlay_path.absolute()
             
             logger.debug(f"Creating overlay from {base_image_abs} to {overlay_path_abs}")
@@ -242,14 +321,14 @@ class FreeBSDVM:
             ])
         
         # Prepare pid file
-        self.vm_pid_file = Path(f"/tmp/freebsd-vm-{self.vm_id}.pid")
+        self.vm_pid_file = Path(f"/tmp/freebsd-vm-{self.vm_id}-{self.arch}.pid")
         
-        # Build QEMU command with appropriate acceleration
+        # Build QEMU command with appropriate acceleration and machine type
         cmd = [
-            "qemu-system-x86_64",
+            self.qemu_binary,
             "-name", f"freebsd-ps5-{self.vm_id}",
-            "-machine", "q35",
-            "-accel", self.accel_type,  # Use detected acceleration
+            "-machine", "q35",  # q35 works for both x86_64 and aarch64
+            "-accel", self.accel_type,
             "-m", "4096",
             "-smp", "4",
             "-drive", f"file={self.overlay_path},format=qcow2,if=virtio",
@@ -260,6 +339,20 @@ class FreeBSDVM:
             "-pidfile", str(self.vm_pid_file)
         ] + virtio_args
         
+        # Add architecture-specific options
+        if self.arch in ['arm64', 'aarch64']:
+            # For ARM64, we need UEFI firmware
+            firmware_paths = [
+                "/usr/share/qemu-efi-aarch64/QEMU_EFI.fd",
+                "/usr/local/share/qemu/edk2-aarch64-code.fd",
+                "/usr/share/AAVMF/AAVMF_CODE.fd"
+            ]
+            for fw_path in firmware_paths:
+                if Path(fw_path).exists():
+                    cmd.extend(["-bios", fw_path])
+                    logger.debug(f"Using UEFI firmware: {fw_path}")
+                    break
+        
         if self.debug:
             logger.debug(f"VM command: {' '.join(cmd)}")
         
@@ -267,12 +360,13 @@ class FreeBSDVM:
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
                 logger.error(f"QEMU failed to start: {result.stderr}")
-                # Try without KVM if that was the issue
-                if "invalid accelerator" in result.stderr and self.accel_type == "kvm":
+                # Try without acceleration if that was the issue
+                if "invalid accelerator" in result.stderr:
                     logger.info("Retrying with TCG acceleration...")
                     self.accel_type = "tcg"
                     # Replace the acceleration in command
-                    cmd[cmd.index("-accel") + 1] = "tcg"
+                    accel_idx = cmd.index("-accel") + 1
+                    cmd[accel_idx] = "tcg"
                     result = subprocess.run(cmd, capture_output=True, text=True)
                     if result.returncode != 0:
                         logger.error(f"QEMU failed again with TCG: {result.stderr}")
@@ -280,7 +374,7 @@ class FreeBSDVM:
                 else:
                     return False
             
-            # Wait for SSH
+            # Wait for SSH (longer timeout for TCG or cross-emulation)
             if self._wait_for_ssh():
                 # Setup mount points inside VM
                 if self._setup_mounts():
@@ -336,15 +430,16 @@ class FreeBSDVM:
             logger.error(f"Failed to setup mounts: {e}")
             return False
     
-    def _wait_for_ssh(self, timeout: int = 120) -> bool:
-        """Wait for SSH to become available (longer timeout for TCG)"""
-        # TCG is slower, so use longer timeout
-        if self.accel_type == "tcg":
-            timeout = 180
-            logger.info("⏳ Using TCG emulation (slower), waiting up to 3 minutes for boot...")
-        else:
-            logger.info("⏳ Waiting for VM to boot and SSH to become available...")
+    def _wait_for_ssh(self, timeout: int = None) -> bool:
+        """Wait for SSH to become available (longer timeout for slow emulation)"""
+        # Set timeout based on acceleration type
+        if timeout is None:
+            if self.accel_type == "tcg":
+                timeout = 300  # 5 minutes for TCG
+            else:
+                timeout = 120  # 2 minutes for hardware accel
         
+        logger.info(f"⏳ Waiting for VM to boot (timeout: {timeout}s)...")
         start_time = time.time()
         attempt = 0
         while time.time() - start_time < timeout:
@@ -525,9 +620,7 @@ class FreeBSDVM:
         if not self.keep_alive:
             self.stop()
 
-# ... (rest of the code remains the same as previous version)
-
-# ── metadata ────────────────────────────────────────────────────────────────────
+# ── metadata (unchanged from previous) ─────────────────────────────────────
 
 class MetadataStore:
     def __init__(self, cache_path: Path, debug: bool = False):
@@ -647,6 +740,14 @@ def main():
     use_qemu = '--qemu' in sys.argv
     keep_vm = '--keep-vm' in sys.argv
     
+    # Parse architecture
+    arch = DEFAULT_ARCH
+    for i, arg in enumerate(sys.argv):
+        if arg.startswith('--arch='):
+            arch = arg.split('=')[1]
+        elif arg == '--arch' and i+1 < len(sys.argv):
+            arch = sys.argv[i+1]
+    
     # Parse FreeBSD version if provided
     freebsd_version = DEFAULT_FREEBSD_VERSION
     for i, arg in enumerate(sys.argv):
@@ -674,6 +775,7 @@ def main():
     logger.info(f"🎮 Mode  : {'QEMU/FreeBSD' if use_qemu else 'Native'}")
     logger.info(f"💾 VM Base: {VM_BASE_DIR}")
     logger.info(f"💾 VM Overlays: {VM_OVERLAY_DIR}")
+    logger.info(f"🔧 Architecture: {arch} ({ARCH_MAP[arch]['description']})")
     logger.info(f"🔧 FreeBSD Version: {freebsd_version}")
     
     if dry_run:
@@ -729,7 +831,8 @@ def main():
             logger.info(f"🔧 Mounting {output_base} as 'output' tag")
             
             try:
-                with FreeBSDVM(games_base, output_base, freebsd_version=freebsd_version, 
+                with FreeBSDVM(games_base, output_base, arch=arch, 
+                             freebsd_version=freebsd_version,
                              debug=debug, keep_alive=keep_vm) as vm:
                     for game_dir, code, clean_title, ext in ps5_entries:
                         stem = f"{clean_title}.{code}"
