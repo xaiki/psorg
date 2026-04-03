@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-mkffpkg.py - Create ffexfat/ffpfs single-file images from organized PS4/PS5 dumps.
+mkffpkg.py - Create ffexfat/ffufs single-file images from organized PS4/PS5 dumps.
 
 Reuses metadata/naming logic from ps.org.py.
 - CUSA* (PS4) → .ffexfat via mkexfat.sh
-- PPSA* (PS5) → .ffpfs   via mkpfs.sh
+- PPSA* (PS5) → .ffufs   via mkufs.sh
 
 Usage:
     mkffpkg.py [dumps_dir] [ffpkg_dir] [--dry-run] [--force] [--debug]
@@ -30,12 +30,12 @@ logger = logging.getLogger(__name__)
 
 CACHE_FILE      = "ps_cache.json"
 API_URL         = "https://api.serialstation.com/v1/title-ids/"
-SCRIPTS_DIR     = Path(__file__).parent          # mkexfat.sh / mkpfs.sh live here
+SCRIPTS_DIR     = Path(__file__).parent          # mkexfat.sh / mkufs.sh live here
 MKEXFAT_SCRIPT  = SCRIPTS_DIR / "mkexfat.sh"
-MKPFS_SCRIPT    = SCRIPTS_DIR / "mkpfs.sh"
+MKufs_SCRIPT    = SCRIPTS_DIR / "mkufs2.sh"
 
 EXT_PS4         = ".ffexfat"
-EXT_PS5         = ".ffpfs"
+EXT_PS5         = ".ffufs"
 
 CODE_PATTERN    = re.compile(r'(CUSA|PPSA)[-]?(\d{5})', re.IGNORECASE)
 
@@ -107,7 +107,7 @@ def target_ext(code: str):
     return EXT_PS5 if platform(code) == 'PS5' else EXT_PS4
 
 def target_script(code: str):
-    return MKPFS_SCRIPT if platform(code) == 'PS5' else MKEXFAT_SCRIPT
+    return MKufs_SCRIPT if platform(code) == 'PS5' else MKEXFAT_SCRIPT
 
 # ── core ──────────────────────────────────────────────────────────────────────
 
