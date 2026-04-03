@@ -117,6 +117,8 @@ class PSGameOrganizer:
                 if item.name != expected:
                     logger.info(f"📝 Renaming flat file: {item.name} ➡️ {expected}")
                     item.rename(self.base_dir / expected)
+                else:
+                    logger.info(f"✅ Already organized: {item.name}")
                 continue
 
             # Standard Directory Logic
@@ -136,6 +138,8 @@ class PSGameOrganizer:
                     target_dir.mkdir(exist_ok=True)
                     logger.info(f"🚚 Moving: {item.name} ➡️ {expected_folder}/")
                     shutil.move(str(item), str(target_dir/item.name))
+            else:
+                logger.info(f"✅ Already organized: {item.name}")
 
 if __name__ == "__main__":
     debug = "--debug" in sys.argv
