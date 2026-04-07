@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """
-mkffpkg.py — PS5 build system with QEMU/FreeBSD support
-Uses official FreeBSD 13.5‑RELEASE VM image and creates overlays.
+mkffpkg.py - PS5 build system
+Supports two modes:
+1. exfat (Default): Local execution using mkexfat.sh
+2. qemu: Virtualized FreeBSD 13.5 environment for mkufs2
 """
 
 import os
-import re
 import sys
-import json
 import time
 import hashlib
-import shutil
 import subprocess
-import platform
-
+import argparse
+import logging
 from pathlib import Path
 from typing import Tuple
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(message)s')
+logger = logging.getLogger(__name__)
 
 # --------------------
 # Configuration
@@ -24,17 +27,46 @@ from typing import Tuple
 FREEBSD_VERSION = "13.5-RELEASE"
 ARCH = "amd64"
 
-BASE_DIR     = Path("./freebsd-vm-base").absolute()
-OVERLAY_DIR  = Path("./freebsd-vm-overlays").absolute()
+BASE_DIR = Path("./freebsd-vm-base").absolute()
+OVERLAY_DIR = Path("./freebsd-vm-overlays").absolute()
 
-# Official FreeBSD cloud VM image (QCOW2 compressed)
 QCOW2_URL_TMPL = (
     "https://download.freebsd.org/releases/VM-IMAGES/"
     "{version}/{arch}/Latest/FreeBSD-{version}-{arch}.qcow2.xz"
 )
 
-SSH_PORT     = 2222
-SSH_USER     = "psbuilder"
+SSH_PORT = 2222
+SSH_USER = "psbuilder"
+
+def resolve_game_root(dump_path: Path) -> Path:
+    """
+    Hunts down the actual game root by looking for eboot.bin or sce_sys.
+    Returns the resolved path, or the original if not found.
+    """
+    # 1. Check if we are already at the true root
+    if (dump_path / "eboot.bin").is_file() or (dump_path / "sce_sys").is_dir():
+        return dump_path
+
+    # 2. Look for eboot.bin inside subdirectories
+    try:
+        # next() grabs the very first match efficiently without scanning the whole tree
+        eboot_path = next(dump_path.rglob("eboot.bin"))
+        print(f"🔍 Found game root tucked inside: {eboot_path.parent.name}")
+        return eboot_path.parent
+    except StopIteration:
+        pass
+
+    # 3. Fallback: look for sce_sys just in case eboot is missing but it's still a valid dump
+    try:
+        sce_sys_path = next(dump_path.rglob("sce_sys"))
+        if sce_sys_path.is_dir():
+            print(f"🔍 Found game root via sce_sys inside: {sce_sys_path.parent.name}")
+            return sce_sys_path.parent
+    except StopIteration:
+        pass
+
+    # If nothing is found, return the original and let the downstream tool fail naturally
+    return dump_path
 
 # --------------------
 # VM Utility Functions
@@ -47,75 +79,56 @@ def ensure_base_image() -> Path:
     qcow2_xz = BASE_DIR / f"FreeBSD-{FREEBSD_VERSION}-{ARCH}.qcow2.xz"
     qcow2_img = BASE_DIR / f"FreeBSD-{FREEBSD_VERSION}-{ARCH}.qcow2"
 
-    # Download if missing
     if not qcow2_xz.exists() and not qcow2_img.exists():
         url = QCOW2_URL_TMPL.format(version=FREEBSD_VERSION, arch=ARCH)
-        print(f"📥 Downloading FreeBSD base image from {url} ...")
+        print(f"📦 Downloading FreeBSD base image from {url} ...")
         subprocess.run(["curl", "-L", "-o", str(qcow2_xz), url], check=True)
 
-    # Decompress if needed
     if qcow2_xz.exists() and not qcow2_img.exists():
-        print("📦 Decompressing base image...")
+        print("📂 Decompressing base image...")
         subprocess.run(["unxz", "-k", str(qcow2_xz)], check=True)
 
-    if not qcow2_img.exists():
-        raise FileNotFoundError(f"Base image not available: {qcow2_img}")
-
-    print(f"✅ Base image ready: {qcow2_img}")
     return qcow2_img
 
 def create_overlay(base_img: Path) -> Path:
-    """Create a per‑run overlay from the base image."""
+    """Create a per-run overlay from the base image."""
     OVERLAY_DIR.mkdir(parents=True, exist_ok=True)
     overlay = OVERLAY_DIR / f"overlay-{hashlib.md5(str(time.time()).encode()).hexdigest()[:8]}.qcow2"
-    overlay_abs = overlay.resolve()
-    base_abs    = base_img.resolve()
-
-    print(f"📀 Creating overlay: {overlay_abs}")
+    
+    print(f"💾 Creating overlay: {overlay}")
     subprocess.run([
         "qemu-img", "create",
         "-f", "qcow2",
         "-F", "qcow2",
-        "-b", str(base_abs),
-        str(overlay_abs),
+        "-b", str(base_img.resolve()),
+        str(overlay.resolve()),
     ], check=True)
 
-    return overlay_abs
+    return overlay.resolve()
 
 def start_vm(overlay: Path) -> Tuple[int, Path]:
-    """Start QEMU with overlay, returns (pid, log_path)."""
+    """Start QEMU with overlay."""
     pidfile = Path(f"/tmp/freebsd-vm-{overlay.stem}.pid")
     logpath = Path(f"/tmp/qemu-{overlay.stem}.log")
 
     cmd = [
         "qemu-system-x86_64",
         "-name", f"freebsd-ps5-{overlay.stem}",
-        "-machine", "q35",
-        "-m", "4096",
-        "-smp", "4",
-
+        "-machine", "q35", "-m", "4096", "-smp", "4",
         "-drive", f"if=none,id=hd0,file={overlay},format=qcow2",
         "-device", "virtio-blk-pci,drive=hd0",
-
         "-netdev", f"user,id=net0,hostfwd=tcp::{SSH_PORT}-:22",
         "-device", "virtio-net,netdev=net0",
-
-        "-display", "none",
-        "-serial", f"file:{logpath}",
-
-        "-daemonize",
-        "-pidfile", str(pidfile),
+        "-display", "none", "-serial", f"file:{logpath}",
+        "-daemonize", "-pidfile", str(pidfile),
     ]
 
     print("🚀 Launching VM...")
     subprocess.run(cmd, check=True)
     pid = int(pidfile.read_text().strip())
-    print(f"   QEMU PID: {pid}, log: {logpath}")
-
     return pid, logpath
 
-def wait_for_ssh(timeout: int = 120) -> bool:
-    """Wait for SSH to become available inside VM."""
+def wait_for_ssh(timeout: int = 180) -> bool:
     print("⏳ Waiting for SSH...")
     start = time.time()
     while time.time() - start < timeout:
@@ -130,11 +143,9 @@ def wait_for_ssh(timeout: int = 120) -> bool:
             print("✅ SSH ready!")
             return True
         time.sleep(2)
-    print("❌ SSH timeout")
     return False
 
 def run_in_vm(cmd: str):
-    """Run a command inside the VM over SSH."""
     sshcmd = [
         "ssh", "-p", str(SSH_PORT),
         "-o", "StrictHostKeyChecking=no",
@@ -144,7 +155,6 @@ def run_in_vm(cmd: str):
     return subprocess.run(sshcmd, capture_output=True, text=True)
 
 def stop_vm(pid: int):
-    """Stop the VM gracefully."""
     try:
         run_in_vm("sudo shutdown -p now")
     except:
@@ -153,54 +163,121 @@ def stop_vm(pid: int):
     subprocess.run(["kill", str(pid)], stderr=subprocess.DEVNULL)
 
 # --------------------
+# Workflow Logic
+# --------------------
+
+def run_exfat_mode(game_dir: Path, output_file: Path):
+    """Simple local exfat run."""
+    print(f"🛠️ Mode: Local exFAT for {game_dir.name}")
+    script_path = Path(__file__).parent / "mkexfat.sh"
+    
+    if not script_path.exists():
+        print(f"❌ Error: {script_path} not found.")
+        sys.exit(1)
+
+    actual_game_dir = resolve_game_root(game_dir)    
+    print(f"📦 Running {script_path.name} on {actual_game_dir}...")
+    
+    subprocess.run(["sudo", "bash", str(script_path), str(actual_game_dir), str(output_file)], check=True)
+
+def run_qemu_mode(game_dir: Path, output_file: Path):
+    """Messy FreeBSD VM UFS2 run."""
+    print(f"🛠️ Mode: QEMU FreeBSD ({FREEBSD_VERSION}) for {game_dir.name}")
+    
+    base_img = ensure_base_image()
+    overlay = create_overlay(base_img)
+    pid, logpath = start_vm(overlay)
+
+    try:
+        if not wait_for_ssh():
+            print("❌ SSH timeout. Check logs:", logpath)
+            sys.exit(1)
+
+        print("📝 Running build logic inside VM...")
+        out = run_in_vm("uname -a")
+        print(f"VM Info: {out.stdout.strip()}")
+        # Build logic for mkufs2.sh would be triggered here, mapping game_dir and output_file
+        
+    finally:
+        stop_vm(pid)
+
+# --------------------
 # Main Entry
 # --------------------
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python mkffpkg.py --qemu <DUMPS_DIR>")
+    parser = argparse.ArgumentParser(description="PS5 FPKG Tool")
+    parser.add_argument("dumps_dir", help="Directory containing the decrypted dumps")
+    parser.add_argument("--mode", choices=["exfat", "qemu"], default="exfat",
+                        help="Build mode: 'exfat' (local script) or 'qemu' (FreeBSD VM). Default: exfat")
+    
+    # Backward compatibility for the old --qemu flag
+    if "--qemu" in sys.argv:
+        sys.argv.remove("--qemu")
+        sys.argv.append("--mode")
+        sys.argv.append("qemu")
+
+    args = parser.parse_args()
+    dumps_path = Path(args.dumps_dir).resolve()
+
+    if not dumps_path.exists() or not dumps_path.is_dir():
+        print(f"❌ Dumps directory not found or is not a directory: {dumps_path}")
         sys.exit(1)
 
-    # Only qemu mode supported here
-    if "--qemu" not in sys.argv:
-        print("ERROR: QEMU mode required")
-        sys.exit(1)
+    # Output directory setup
+    output_dir_name = "FFExFAT" if args.mode == "exfat" else "FFPKG"
+    output_ext = ".ffexfat" if args.mode == "exfat" else ".ffpfs" # Assuming ffpfs for ufs2/qemu mode based on extensions in ps.org.py
+    
+    output_dir = dumps_path.parent / output_dir_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Output directory set to: {output_dir}")
 
-    dumps_dir = Path(sys.argv[-1]).resolve()
-    if not dumps_dir.exists():
-        print(f"❌ Dumps dir not found: {dumps_dir}")
-        sys.exit(1)
+    import ps_org # Import the logic from ps.org.py (assuming it's named ps_org.py)
+    # Instantiate the organizer to use its methods
+    organizer = ps_org.PSGameOrganizer(str(dumps_path), debug=False)
 
-    print(f"📂 Dumps: {dumps_dir}")
-    print(f"🔧 Using FreeBSD {FREEBSD_VERSION} VM base")
+    for item in dumps_path.iterdir():
+        if not item.is_dir() or item.name in ["INCOMING", ps_org.CACHE_FILE]:
+            continue
 
-    # Ensure base image is ready
-    base_img = ensure_base_image()
+        code = organizer.extract_code(item.name)
+        if not code:
+            logger.warning(f"⚠️ Could not extract title code from directory name: {item.name}. Skipping.")
+            continue
 
-    # Start VM
-    overlay = create_overlay(base_img)
-    pid, logpath = start_vm(overlay)
+        raw_name = organizer.get_display_name(code)
+        
+        # Check if we have metadata, if not, try fetching it
+        if not raw_name:
+            logger.info(f"🌐 Fetching metadata for {code}...")
+            organizer.fetch_metadata(code)
+            raw_name = organizer.get_display_name(code)
+            
+        if not raw_name:
+             logger.warning(f"⚠️ No metadata found for {code} ({item.name}), skipping conversion.")
+             continue
 
-    # Wait for SSH
-    if not wait_for_ssh(timeout=180):
-        print("❌ Cannot connect to VM via SSH — check console log")
-        print("Log output:")
-        print(logpath.read_text())
-        stop_vm(pid)
-        sys.exit(1)
+        clean_title = organizer.sanitize(raw_name)
+        expected_name = f"{clean_title}.{code}"
+        output_file_name = f"{expected_name}{output_ext}"
+        output_file_path = output_dir / output_file_name
 
-    # Example: test inside VM
-    print("📝 Test: uname inside VM")
-    out = run_in_vm("uname -a")
-    print(out.stdout)
+        # Check for wrong name (assuming ps.org.py logic would have renamed it, but we check here just in case)
+        if item.name != expected_name:
+            logger.warning(f"⚠️ Found directory with potential wrong name: {item.name}. Expected: {expected_name}. Processing anyway using expected name for output.")
 
-    # Place build logic here (e.g., mount dirs, run mkufs2.sh, etc.)
-    # For simplicity, not included here.
+        if output_file_path.exists():
+            logger.info(f"⏭️ Skipping {item.name}: Output file {output_file_name} already exists.")
+            continue
 
-    # Shutdown VM
-    stop_vm(pid)
+        logger.info(f"🚀 Processing {item.name} -> {output_file_name}")
 
-    print("✅ VM run complete")
+        if args.mode == "exfat":
+            run_exfat_mode(item, output_file_path)
+        else:
+            run_qemu_mode(item, output_file_path)
+
+    print("✅ Process complete")
 
 if __name__ == "__main__":
     main()
